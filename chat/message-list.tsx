@@ -1,415 +1,418 @@
 import { v4 as uuidv4 } from 'uuid';
-import React, { useState, useEffect, useMemo, useCallback, memo } from 'react';
-import { Bot, Loader2, Database } from 'lucide-react';
+import React, { useState, useEffect, useMemo, useCallback, memo, useRef } from 'react';
+import { Bot, Loader2, Database, Sparkles } from 'lucide-react';
 import { useCascade } from '@cascaide-ts/react';
 import { MessageBubble } from './message-bubble';
+import { CanonicalMessage } from './types';
+import { Spawns } from './types';
 
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------+
 // TOOL REGISTRY
-//
-// This is the main place you extend the chat UI.
-//
-// Each key is a tool name your LLM can call.
-// Each value is a React component that receives:
-//   - args        — parsed tool call arguments (what the LLM passed)
-//   - onComplete  — call this with a string result to send a tool response
-//                   and continue the cascade. Omit if this is display-only.
-//   - isFinished  — true if a tool response already exists (e.g. on reload)
-//   - savedResult — the existing tool response string if isFinished is true
-//
-// DISPLAY TOOL (no user interaction):
-//   my_chart_tool: ({ args }) => <ChartRenderer data={args.data} />
-//
-// INPUT TOOL (user acts, cascade continues):
-//   my_approval_tool: ({ args, onComplete, isFinished, savedResult }) => (
-//     <ApprovalCard
-//       request={args.request}
-//       onApprove={() => onComplete('approved')}
-//       onReject={() => onComplete('rejected')}
-//       isFinished={isFinished}
-//       savedResult={savedResult}
-//     />
-//   )
 // ---------------------------------------------------------------------------
-
 import { HotelOptions } from './tool-ui/hotel-tool';
 
 export type ToolComponentProps = {
-    args: any;
-    onComplete: (result: string) => void;
-    isFinished: boolean;
-    savedResult: string | null;
+  args:        Record<string, any>;
+  onComplete:  (result: string) => void;
+  isFinished:  boolean;
+  savedResult: string | null;
 };
 
 export const toolRegistry: Record<string, React.ComponentType<ToolComponentProps>> = {
-    // ---
-    // Example input tool: user selects a hotel, cascade continues with their choice.
-    // Replace or extend this with your own tools.
-    // ---
-    present_hotel_options: HotelOptions,
+  present_hotel_options: HotelOptions,
 };
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const LAPIS        = '#26619C';
+const LAPIS_LIGHT  = 'rgba(38,97,156,0.08)';
+const LAPIS_BORDER = 'rgba(38,97,156,0.25)';
 
 // ---------------------------------------------------------------------------
-// Types
+// Types & Constants
 // ---------------------------------------------------------------------------
-
 type DelegationStatus = 'pending' | 'complete';
-
 type Delegation = {
-    subCascadeId: string;
-    toolCallId: string;
-    agentName: string;
-    status: DelegationStatus;
+  subCascadeId: string;
+  toolCallId:   string;
+  agentName:    string;
+  status:       DelegationStatus;
 };
 
+const ALLOWED_AGENTS = ['availabilityAgentNode', 'bookingAgentNode'];
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-// Converts 'delegate_to_availabilityAgentNode' → 'availabilityAgentNode'
-// Matches the node name convention in your graph.
-// Update this if your delegation tool naming convention differs.
-const getSubAgentNodeName = (toolName: string): string | null => {
-    if (toolName.startsWith('delegate_to_')) {
-        return toolName.replace('delegate_to_', '') + 'Node';
-    }
-    return null;
+const getDelegationAgentName = (toolName: string): string | null => {
+  if (!toolName.startsWith('delegate_to_')) return null;
+  const agentName = toolName.replace('delegate_to_', '') + 'Node';
+  console.log(agentName);
+  const isAllowed = ALLOWED_AGENTS.includes(agentName);
+  console.log(isAllowed);
+  return isAllowed ? agentName : null;
 };
 
-
+const getAgentLabel = (agentName: string) =>
+  agentName.includes('availability') ? 'Availability Agent' : 'Booking Agent';
 
 // ---------------------------------------------------------------------------
 // MessageList
-//
-// Owns two things:
-//   1. Delegation orchestration — spawning sub-cascades when the supervisor
-//      delegates to a sub-agent, and returning results via handleToolResponse.
-//   2. Tool rendering — looking up tool components from the registry and
-//      wiring their onComplete → handleToolResponse automatically.
-//
-// Users should not need to modify this file to add new tools.
-// Add tool UIs to toolRegistry above instead.
 // ---------------------------------------------------------------------------
-
 export const MessageList = memo(({
-    displayHistory,
-    userId,
-    addActiveNode,
-    handleToolResponse,
+  displayHistory,
+  userId,
+  addActiveNode,
+  handleToolResponse,
 }: {
-    displayHistory: any[];
-    userId: string | undefined;
-    // addActiveNode comes from useWorkflow — triggers a node execution in the graph
-    addActiveNode: any;
-    // handleToolResponse sends a tool result message and continues the cascade
-    handleToolResponse: any;
+  displayHistory:     CanonicalMessage[];
+  userId:             string | undefined;
+  addActiveNode:      any;
+  handleToolResponse: any;
 }) => {
-    // Tracks all delegations: their cascade ID, agent name, and completion status.
-    // A single map is used so parallel delegations can be managed together.
-    const [delegations, setDelegations] = useState<Map<string, Delegation>>(new Map());
+  const [delegations, setDelegations] = useState<Map<string, Delegation>>(new Map());
+  const completedToolCallIds = useRef<Set<string>>(new Set());
 
-    const getDelegationStatus = (toolCallId: string): DelegationStatus | null =>
-        delegations.get(toolCallId)?.status ?? null;
+  const getDelegationStatus = (toolCallId: string): DelegationStatus | null =>
+    delegations.get(toolCallId)?.status ?? null;
 
+  // ── Delegation detection ─────────────────────────────────────────────────
+  useEffect(() => {
+    const processDelegations = async () => {
+      if (displayHistory.length === 0) return;
 
-    // ---
-    // Delegation detection
-    //
-    // When the supervisor calls a 'delegate_to_*' tool, we:
-    //   1. Spawn a new sub-cascade for the sub-agent via addActiveNode (useWorkflow)
-    //   2. Track it in state so CascadeMonitor can observe it via useCascade
-    //   3. When the sub-cascade completes, send its result back as a tool response
-    //
-    // This runs whenever displayHistory changes, checking only the last assistant message
-    // to avoid reprocessing previous delegations.
-    // ---
-    useEffect(() => {
-        const processDelegations = async () => {
-            if (displayHistory.length === 0) return;
+      const lastAssistantIndex = displayHistory.findLastIndex(
+        msg => msg.role === 'assistant' && msg.tool_calls?.length
+      );
 
-            const lastAssistantIndex = displayHistory.findLastIndex(
-                msg => msg.role === 'assistant' && msg.tool_calls
-            );
-            if (lastAssistantIndex === -1) return;
+      if (lastAssistantIndex === -1) return;
 
-            const lastAssistantMessage = displayHistory[lastAssistantIndex];
-            const delegationTools = lastAssistantMessage.tool_calls.filter((tc: any) =>
-                tc.function.name.startsWith('delegate_to_')
-            );
-            if (delegationTools.length === 0) return;
+      const lastAssistantMessage = displayHistory[lastAssistantIndex];
+      console.log('checking for delegation calls');
 
-            for (const toolCall of delegationTools) {
-                // Skip if already being tracked
-                if (delegations.has(toolCall.id)) continue;
+      const delegationCalls = (lastAssistantMessage.tool_calls ?? []).filter(
+        tc => getDelegationAgentName(tc.name) !== null
+      );
 
-                // If a tool result already exists in history, mark complete immediately
-                const hasToolResult = displayHistory.slice(lastAssistantIndex + 1).some(msg =>
-                    msg.role === 'tool' && msg.tool_call_id === toolCall.id
-                );
-                if (hasToolResult) {
-                    setDelegations(prev => {
-                        const next = new Map(prev);
-                        next.set(toolCall.id, {
-                            subCascadeId: '',
-                            toolCallId: toolCall.id,
-                            agentName: '',
-                            status: 'complete',
-                        });
-                        return next;
-                    });
-                    continue;
-                }
+      for (const toolCall of delegationCalls) {
+        if (delegations.has(toolCall.id)) continue;
 
-                // Wait for arguments to finish streaming before parsing
-                const argsString = toolCall.function.arguments;
-                if (!argsString?.trim().endsWith('}')) {
-                    if (lastAssistantIndex === displayHistory.length - 1) continue;
-                }
+        const hasToolResult = displayHistory.slice(lastAssistantIndex + 1).some(
+          msg => msg.role === 'tool' && msg.tool_result?.tool_call_id === toolCall.id
+        );
 
-                try {
-                    const args = JSON.parse(argsString);
-                    const subNodeName = getSubAgentNodeName(toolCall.function.name);
-                    const query = args.query;
-                    if (!subNodeName || !query) {
-                        console.error('Invalid delegation arguments:', toolCall);
-                        continue;
-                    }
+        if (hasToolResult) {
+          completedToolCallIds.current.add(toolCall.id);
+          setDelegations(prev => {
+            const next = new Map(prev);
+            next.set(toolCall.id, {
+              subCascadeId: '',
+              toolCallId:   toolCall.id,
+              agentName:    '',
+              status:       'complete',
+            });
+            return next;
+          });
+          continue;
+        }
 
-                    const newSubCascadeId = `sub_cascade_${uuidv4()}`;
+        const agentName = getDelegationAgentName(toolCall.name);
+        const subtask   = toolCall.args.query as string;
 
-                    setDelegations(prev => {
-                        const next = new Map(prev);
-                        next.set(toolCall.id, {
-                            subCascadeId: newSubCascadeId,
-                            toolCallId: toolCall.id,
-                            agentName: subNodeName,
-                            status: 'pending',
-                        });
-                        return next;
-                    });
+        if (!agentName || !subtask) continue;
 
-                    // Trigger the sub-agent node in the graph.
-                    // The sub-cascade ID links this execution to CascadeMonitor below.
-                    await addActiveNode(subNodeName, {
-                        cascadeId: newSubCascadeId,
-                        history: [{ role: 'user', content: query.trim() }],
-                        originalToolCallId: toolCall.id,
-                        userId,
-                    });
-                } catch (error) {
-                    console.error('Error processing delegation:', error);
-                }
-            }
+        const newSubCascadeId = `sub_cascade_${uuidv4()}`;
+        setDelegations(prev => {
+          const next = new Map(prev);
+          next.set(toolCall.id, {
+            subCascadeId: newSubCascadeId,
+            toolCallId:   toolCall.id,
+            agentName,
+            status:       'pending',
+          });
+          return next;
+        });
+
+        const spawns: Spawns = {
+          [agentName]: {
+            cascadeId:          newSubCascadeId,
+            history:            [{ role: 'user', content: subtask }] as CanonicalMessage[],
+            originalToolCallId: toolCall.id,
+            userId,
+          },
         };
 
-        processDelegations();
-    }, [displayHistory.length, displayHistory[displayHistory.length - 1]]);
+        try {
+          await addActiveNode(spawns);
+        } catch (err) {}
+      }
+    };
 
+    processDelegations();
+  }, [displayHistory.length, displayHistory[displayHistory.length - 1]]);
 
-    // ---
-    // Called by CascadeMonitor when a sub-cascade completes.
-    // Sends the result back as a tool response to continue the parent cascade,
-    // then marks the delegation complete.
-    // ---
-    const handleDelegationComplete = useCallback((toolCallId: string, result: string) => {
-        handleToolResponse({
-            role: 'tool',
-            tool_call_id: toolCallId,
-            content: result || 'Sub-cascade completed successfully.',
-        });
+  // ── Handle sub-cascade completion ────────────────────────────────────────
+  const handleDelegationComplete = useCallback((toolCallId: string, result: string) => {
+    completedToolCallIds.current.add(toolCallId);
 
-        setDelegations(prev => {
-            const next = new Map(prev);
-            const existing = next.get(toolCallId);
-            if (existing) next.set(toolCallId, { ...existing, status: 'complete' });
-            return next;
-        });
-    }, [handleToolResponse]);
+    const toolMsg: CanonicalMessage = {
+      role:        'tool',
+      tool_result: {
+        tool_call_id: toolCallId,
+        content:      result || 'Sub-cascade completed successfully.',
+      },
+    };
 
+    handleToolResponse(toolMsg);
 
-    // Clean up completed delegations once all parallel ones are done
-    useEffect(() => {
-        const values = Array.from(delegations.values());
-        if (values.some(d => d.status === 'pending')) return;
-        if (!values.some(d => d.status === 'complete')) return;
+    setDelegations(prev => {
+      const next     = new Map(prev);
+      const existing = next.get(toolCallId);
+      if (existing) next.set(toolCallId, { ...existing, status: 'complete' });
+      return next;
+    });
+  }, [handleToolResponse]);
 
-        setDelegations(prev => {
-            const next = new Map(prev);
-            for (const [id, d] of next) {
-                if (d.status === 'complete') next.delete(id);
-            }
-            return next;
-        });
-    }, [delegations]);
+  // Cleanup completed delegations once all parallel ones finish
+  useEffect(() => {
+    const values = Array.from(delegations.values());
+    if (values.length === 0) return;
+    if (values.some(d => d.status === 'pending')) return;
 
+    setDelegations(prev => {
+      const next = new Map(prev);
+      for (const [id, d] of next) {
+        if (d.status === 'complete') next.delete(id);
+      }
+      return next;
+    });
+  }, [delegations]);
 
-    const showAILoading = useMemo(() =>
-        displayHistory.length > 0 &&
-        displayHistory[displayHistory.length - 1]?.role === 'user' &&
-        delegations.size === 0,
-        [displayHistory.length, displayHistory[displayHistory.length - 1]?.role, delegations.size]
-    );
+  const showAILoading = useMemo(() => {
+    if (displayHistory.length === 0) return false;
+    if (delegations.size !== 0) return false;
+    const last = displayHistory[displayHistory.length - 1];
+    if (last?.role !== 'assistant') return true;
+    return !last.content && !last.thinking && !last.tool_calls?.length;
+  }, [displayHistory.length, displayHistory[displayHistory.length - 1], delegations.size]);
 
-    const activeDelegations = useMemo(() =>
-        Array.from(delegations.values()).filter(d => d.status === 'pending'),
-        [delegations]
-    );
+  const activeDelegations = useMemo(
+    () => Array.from(delegations.values()).filter(d => d.status === 'pending'),
+    [delegations]
+  );
 
-    return (
-        <div className="flex-1 overflow-y-auto px-6 py-4">
-            <div className="max-w-4xl mx-auto">
-                {displayHistory.map((msg, idx) => {
-                    // Skip raw tool result messages — they are consumed by the tool UI
-                    if (msg.role === 'tool') return null;
+  return (
+    <div className="flex-1 overflow-y-auto px-6 py-4">
+      <div className="max-w-4xl mx-auto">
 
-                    // For each registered tool call in this message, find if a tool
-                    // response already exists in history (used for isFinished + savedResult)
-                    const toolResults: Record<string, any> = {};
-                    msg.tool_calls?.forEach((tc: any) => {
-                        const result = displayHistory.slice(idx + 1).find(
-                            m => m.role === 'tool' && m.tool_call_id === tc.id
-                        );
-                        if (result) toolResults[tc.id] = result;
-                    });
+        {displayHistory.map((msg, idx) => {
+          if (msg.role === 'tool') return null;
 
-                    // Find delegation tool call for status indicator in MessageBubble
-                    const delegationTool = msg.tool_calls?.find((tc: any) =>
-                        tc.function.name.startsWith('delegate_to_')
-                    );
+          const toolResults: Record<string, CanonicalMessage> = {};
+          msg.tool_calls?.forEach(tc => {
+            const result = displayHistory.slice(idx + 1).find(
+              m => m.role === 'tool' && m.tool_result?.tool_call_id === tc.id
+            );
+            if (result) toolResults[tc.id] = result;
+          });
 
-                    return (
-                        <div key={`${idx}-${msg.role}`}>
-                            <MessageBubble
-                                message={msg}
-                                userId={userId}
-                                delegationStatus={delegationTool
-                                    ? getDelegationStatus(delegationTool.id)
-                                    : null
-                                }
-                                // Wire tool registry: MessageBubble receives handleToolResponse
-                                // and toolResults so it can build onComplete and isFinished
-                                // for each tool component without exposing those internals
-                                // to the tool components themselves.
-                                onToolComplete={async (toolCallId, result) => {
-                                    await handleToolResponse({
-                                        role: 'tool',
-                                        tool_call_id: toolCallId,
-                                        content: result,
-                                    });
-                                }}
-                                toolResults={toolResults}
-                            />
-                        </div>
-                    );
-                })}
+          const delegationCall = msg.tool_calls?.find(
+            tc => getDelegationAgentName(tc.name) !== null
+          );
 
-                {/* Shown while the LLM is generating a response */}
-                {showAILoading && (
-                    <div className="flex items-start gap-4 py-4">
-                        <div className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center bg-gradient-to-br from-blue-500 to-indigo-600 text-white">
-                            <Bot className="w-4 h-4" />
-                        </div>
-                        <div className="flex-1 min-w-0">
-                            <div className="text-sm font-semibold mb-2 text-gray-500">Assistant</div>
-                            <div className="rounded-xl px-4 py-3 bg-transparent border border-blue-100">
-                                <div className="flex items-center gap-2">
-                                    <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />
-                                    <span className="text-base text-gray-600">Thinking...</span>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                )}
-
-                {/* One CascadeMonitor per active sub-cascade.
-                    Each one uses useCascade to observe its sub-cascade and calls
-                    handleDelegationComplete when done. */}
-                {activeDelegations.map(delegation => (
-                    <CascadeMonitor
-                        key={delegation.subCascadeId}
-                        subCascadeId={delegation.subCascadeId}
-                        toolCallId={delegation.toolCallId}
-                        agentName={delegation.agentName}
-                        onComplete={handleDelegationComplete}
-                    />
-                ))}
+          return (
+            <div key={`${idx}-${msg.role}`}>
+              <MessageBubble
+                message={msg}
+                userId={userId}
+                delegationStatus={delegationCall ? getDelegationStatus(delegationCall.id) : null}
+                onToolComplete={async (toolCallId, result) => {
+                  await handleToolResponse({
+                    role: 'tool',
+                    tool_result: { tool_call_id: toolCallId, content: result },
+                  } satisfies CanonicalMessage);
+                }}
+                toolResults={toolResults}
+              />
             </div>
-        </div>
-    );
+          );
+        })}
+
+        {/* ── AI thinking indicator ── */}
+        {showAILoading && (
+          <div className="py-3 max-w-4xl mx-auto">
+            <div className="flex items-start gap-3">
+
+              {/* Lapis bot avatar */}
+              <div
+                className="flex-shrink-0 w-7 h-7 rounded-full flex items-center justify-center mt-0.5"
+                style={{ backgroundColor: LAPIS }}
+              >
+                <Bot className="w-3.5 h-3.5 text-white" />
+              </div>
+
+              {/* Thinking pill */}
+              <div
+                className="flex items-center gap-2.5 rounded-xl px-3.5 py-2.5"
+                style={{
+                  background: 'rgba(255,255,255,0.50)',
+                  backdropFilter: 'blur(14px)',
+                  WebkitBackdropFilter: 'blur(14px)',
+                  border: `1px solid rgba(255,255,255,0.65)`,
+                  boxShadow: '0 2px 10px rgba(38,97,156,0.07)',
+                }}
+              >
+                <Loader2
+                  className="w-3.5 h-3.5 animate-spin flex-shrink-0"
+                  style={{ color: LAPIS }}
+                />
+                <span className="text-sm text-slate-500 font-medium">Thinking…</span>
+
+                {/* Animated dots */}
+                <div className="flex items-center gap-1 ml-1">
+                  {[0, 1, 2].map(i => (
+                    <div
+                      key={i}
+                      className="w-1 h-1 rounded-full animate-bounce"
+                      style={{
+                        backgroundColor: LAPIS,
+                        opacity: 0.5,
+                        animationDelay: `${i * 150}ms`,
+                        animationDuration: '900ms',
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── Active delegation cards ── */}
+        {activeDelegations.map(delegation => (
+          <CascadeMonitor
+            key={delegation.subCascadeId}
+            subCascadeId={delegation.subCascadeId}
+            toolCallId={delegation.toolCallId}
+            agentName={delegation.agentName}
+            onComplete={handleDelegationComplete}
+          />
+        ))}
+      </div>
+    </div>
+  );
 });
 
 MessageList.displayName = 'MessageList';
 
-
 // ---------------------------------------------------------------------------
 // CascadeMonitor
-//
-// Mounts for each active sub-cascade delegation.
-// Uses useCascade to observe the sub-cascade state.
-// When complete, extracts the last meaningful message and calls onComplete,
-// which sends it back as a tool response to the parent cascade.
-//
-// This component unmounts itself by triggering handleDelegationComplete,
-// which marks the delegation complete in MessageList state, removing it
-// from activeDelegations and therefore unmounting this component.
 // ---------------------------------------------------------------------------
-
 const CascadeMonitor = memo(({
-    subCascadeId,
-    toolCallId,
-    agentName,
-    onComplete,
+  subCascadeId,
+  toolCallId,
+  agentName,
+  onComplete,
 }: {
-    subCascadeId: string;
-    toolCallId: string;
-    agentName: string;
-    onComplete: (toolCallId: string, result: string) => void;
+  subCascadeId: string;
+  toolCallId:   string;
+  agentName:    string;
+  onComplete:   (toolCallId: string, result: string) => void;
 }) => {
-    // useCascade observes the sub-cascade by ID.
-    // isComplete flips to true when the sub-agent finishes its execution.
-    const { cascadeState, isComplete } = useCascade(subCascadeId);
+  const { cascadeState, isComplete } = useCascade(subCascadeId);
 
-    useEffect(() => {
-        if (!isComplete || !cascadeState) return;
+  useEffect(() => {
+    if (!isComplete || !cascadeState) return;
 
-        const history = cascadeState.history;
-        if (!history?.length) {
-            console.warn(`Sub-cascade ${subCascadeId} completed with empty history.`);
-            return;
-        }
+    const history: CanonicalMessage[] = cascadeState.history ?? [];
 
-        // Extract the last meaningful message as the result to return to the supervisor
-        const lastMessage = [...history].reverse().find(msg =>
-            msg.content?.trim().length > 0 &&
-            (msg.role === 'assistant' || msg.role === 'tool')
-        );
+    if (!history.length) return;
 
-        const result = lastMessage?.content ?? 'Sub-cascade completed, but no data was returned.';
-        onComplete(toolCallId, result);
+    const lastAssistant = [...history].reverse().find(msg => msg.role === 'assistant');
 
-        // No hasCompleted guard needed — onComplete causes this component to unmount
-    }, [isComplete, cascadeState]);
+    let result = 'Sub-cascade completed.';
 
-    return (
-        <div className="flex items-start gap-4 py-4">
-            <div className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center bg-gradient-to-br from-purple-500 to-pink-600 text-white">
-                <Database className="w-4 h-4" />
-            </div>
-            <div className="flex-1 min-w-0">
-                <div className="text-sm font-semibold mb-2 text-gray-500">
-                    {agentName || 'Agent'}
-                </div>
-                <div className="rounded-xl px-4 py-3 bg-gradient-to-r from-purple-50 to-pink-50 border border-purple-200">
-                    <div className="flex items-center gap-2">
-                        <Loader2 className="w-4 h-4 text-purple-600 animate-spin" />
-                        <span className="text-base text-gray-700">Working...</span>
-                    </div>
-                </div>
-            </div>
+    if (lastAssistant) {
+      if (lastAssistant.content?.trim()) {
+        result = lastAssistant.content;
+      } else if (lastAssistant.tool_calls?.length) {
+        const calls = lastAssistant.tool_calls.map(tc => tc.name).join(', ');
+        result = `Sub-cascade completed via tools: ${calls}`;
+      }
+    }
+
+    onComplete(toolCallId, result);
+  }, [isComplete, cascadeState, agentName, toolCallId, onComplete]);
+
+  const label = getAgentLabel(agentName);
+
+  return (
+    <div className="py-3 max-w-4xl mx-auto">
+      <div className="flex items-start gap-3">
+
+        {/* Agent avatar */}
+        <div
+          className="flex-shrink-0 w-7 h-7 rounded-full flex items-center justify-center mt-0.5"
+          style={{ backgroundColor: LAPIS }}
+        >
+          <Sparkles className="w-3.5 h-3.5 text-white" />
         </div>
-    );
+
+        {/* Agent card */}
+        <div
+          className="flex-1 rounded-xl overflow-hidden"
+          style={{
+            background: 'rgba(255,255,255,0.45)',
+            backdropFilter: 'blur(14px)',
+            WebkitBackdropFilter: 'blur(14px)',
+            border: `1px solid rgba(255,255,255,0.65)`,
+            borderLeft: `3px solid ${LAPIS}`,
+            boxShadow: '0 2px 12px rgba(38,97,156,0.08)',
+          }}
+        >
+          {/* Label row */}
+          <div className="flex items-center gap-2 px-3.5 py-2.5">
+            <span
+              className="text-xs font-semibold uppercase tracking-wider"
+              style={{ color: LAPIS }}
+            >
+              {label}
+            </span>
+
+            {/* Animated "working" badge */}
+            <span
+              className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded-full ml-auto"
+              style={{
+                color: LAPIS,
+                backgroundColor: LAPIS_LIGHT,
+                border: `1px solid ${LAPIS_BORDER}`,
+              }}
+            >
+              <Loader2 className="w-2.5 h-2.5 animate-spin" />
+              working
+            </span>
+          </div>
+
+          {/* Progress bar */}
+          <div
+            className="h-0.5 w-full overflow-hidden"
+            style={{ backgroundColor: LAPIS_LIGHT }}
+          >
+            <div
+              className="h-full rounded-full animate-pulse"
+              style={{
+                width: '60%',
+                backgroundColor: LAPIS,
+                opacity: 0.5,
+              }}
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 });
 
 CascadeMonitor.displayName = 'CascadeMonitor';
