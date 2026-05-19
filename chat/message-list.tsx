@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import React, { useState, useEffect, useMemo, useCallback, memo, useRef } from 'react';
-import { Bot, Loader2, Database, Sparkles } from 'lucide-react';
+import { Bot, Loader2, Sparkles } from 'lucide-react';
 import { useCascade } from '@cascaide-ts/react';
 import { MessageBubble } from './message-bubble';
 import { CanonicalMessage } from './types';
@@ -49,9 +49,7 @@ const ALLOWED_AGENTS = ['availabilityAgentNode', 'bookingAgentNode'];
 const getDelegationAgentName = (toolName: string): string | null => {
   if (!toolName.startsWith('delegate_to_')) return null;
   const agentName = toolName.replace('delegate_to_', '') + 'Node';
-  console.log(agentName);
   const isAllowed = ALLOWED_AGENTS.includes(agentName);
-  console.log(isAllowed);
   return isAllowed ? agentName : null;
 };
 
@@ -68,9 +66,9 @@ export const MessageList = memo(({
   handleToolResponse,
 }: {
   displayHistory:     CanonicalMessage[];
-  userId:             string | undefined;
-  addActiveNode:      any;
-  handleToolResponse: any;
+  userId?:             string | undefined;
+  addActiveNode?:      any;
+  handleToolResponse?: any; 
 }) => {
   const [delegations, setDelegations] = useState<Map<string, Delegation>>(new Map());
   const completedToolCallIds = useRef<Set<string>>(new Set());
@@ -90,7 +88,6 @@ export const MessageList = memo(({
       if (lastAssistantIndex === -1) return;
 
       const lastAssistantMessage = displayHistory[lastAssistantIndex];
-      console.log('checking for delegation calls');
 
       const delegationCalls = (lastAssistantMessage.tool_calls ?? []).filter(
         tc => getDelegationAgentName(tc.name) !== null

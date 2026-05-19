@@ -1,5 +1,4 @@
-'use client';
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useMemo, useCallback } from 'react';
 import { Menu } from 'lucide-react';
 import { useWorkflow, useCascade } from '@cascaide-ts/react';
 import { v4 as uuidv4 } from 'uuid';
@@ -8,6 +7,7 @@ import { InputBar } from './input.tsx';
 import { MessageList } from './message-list';
 import { Spawns } from './types';
 import { CanonicalMessage } from './types';
+import { RightSidebar } from './rightSidebar';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -121,12 +121,13 @@ export default function Chat({ nodeId }: ChatProps) {
       setPendingUserMessage(newUserMessage);
       setInput('');
 
-      const updatedHistory = [...conversationMessages, newUserMessage];
+      // const updatedHistory = [...conversationMessages, newUserMessage];
 
       const spawns: Spawns = {
         [selectedAgent]: {
           cascadeId: chatId,
-          history: updatedHistory,
+          history: [newUserMessage],
+          //In Lite mode, set history: updatedHistory,
           userId,
         },
       };
@@ -141,12 +142,13 @@ export default function Chat({ nodeId }: ChatProps) {
   const handleToolResponse = useCallback(
     async (toolMessage: CanonicalMessage) => {
       setInput('');
-      const updatedHistory = [...conversationMessages, toolMessage];
+      // const updatedHistory = [...conversationMessages, toolMessage];
 
       const spawns: Spawns = {
         hotelSupervisorNode: {
           cascadeId: chatId,
-          history: updatedHistory,
+          history: [toolMessage],
+          // in lite mode, set history: updatedHistory,
           userId,
         },
       };
@@ -251,6 +253,11 @@ export default function Chat({ nodeId }: ChatProps) {
           )}
         </div>
       </div>
+      {selectedAgent === 'recursiveSearchAgentNode' && <div className="hidden lg:block h-full">
+        <RightSidebar />
+      </div>
+}
+      
 
       {/* Mobile overlay */}
       {isSidebarOpen && (
