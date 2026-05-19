@@ -4,7 +4,7 @@ import path from "path";
 const REGISTRY_CONFIG = {
   "chat": {
     name: "chat-ui",
-    targetPath: "cascaide-ui/chat",
+    targetPath: "components/cascaide-ui/chat",
     dependencies: [
       "@cascaide-ts/react",
       "lucide-react",
@@ -93,8 +93,7 @@ Object.entries(REGISTRY_CONFIG).forEach(([dirName, config]) => {
         path: resolvedPath,
         content: file.content,
         type: "registry:component",
-        // KEY FIX: target forces shadcn to place the file at this exact path,
-        // bypassing all internal path resolution heuristics
+
         target: resolvedPath,
       };
     }),
